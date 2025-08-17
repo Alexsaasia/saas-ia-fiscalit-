@@ -70,12 +70,36 @@ app.post('/api/ask', async (req, res) => {
         return res.status(500).json({ ok: false, error: 'Erreur serveur' });
       }
 
+      // Vérifier si on doit réinitialiser (nouveau mois)
+      const now = new Date();
+      const lastReset = new Date(existingUser.last_reset);
+      const isNewMonth = now.getMonth() !== lastReset.getMonth() || 
+                        now.getFullYear() !== lastReset.getFullYear();
+
+      if (isNewMonth) {
+        // Réinitialiser pour un nouveau mois
+        const { error: resetError } = await supabase
+          .from('usage_limits')
+          .update({ 
+            question_count: 0, 
+            last_reset: now.toISOString() 
+          })
+          .eq('user_ip', userIP);
+        
+        if (resetError) {
+          console.error('❌ Erreur réinitialisation mensuelle:', resetError.message);
+        } else {
+          console.log(`🔄 Réinitialisation mensuelle pour ${userIP}`);
+          existingUser.question_count = 0;
+        }
+      }
+
       // Si l'utilisateur existe et a atteint la limite
       if (existingUser && existingUser.question_count >= 5) {
         console.log(`🚫 Limite atteinte pour ${userIP}: ${existingUser.question_count}/5`);
         return res.status(429).json({ 
           ok: false, 
-          error: 'Vous avez atteint la limite gratuite de 5 questions.',
+          error: 'Vous avez atteint la limite gratuite de 5 questions. Réinitialisation le mois prochain.',
           usage: { count: existingUser.question_count, limit: 5 }
         });
       }
@@ -226,6 +250,40 @@ app.get('/api/usage', async (req, res) => {
         remaining: 5
       }
     });
+  }
+});
+
+// ===== API: réinitialiser manuellement l'usage (admin)
+app.post('/api/reset-usage', async (req, res) => {
+  const userIP = req.clientIp || 'unknown';
+  
+  if (!supabase) {
+    return res.status(500).json({ ok: false, error: 'Supabase non configuré' });
+  }
+  
+  try {
+    const { error } = await supabase
+      .from('usage_limits')
+      .update({ 
+        question_count: 0, 
+        last_reset: new Date().toISOString() 
+      })
+      .eq('user_ip', userIP);
+    
+    if (error) {
+      console.error('❌ Erreur réinitialisation manuelle:', error.message);
+      return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+    }
+    
+    console.log(`🔄 Réinitialisation manuelle pour ${userIP}`);
+    res.json({ 
+      ok: true, 
+      message: 'Usage réinitialisé avec succès',
+      usage: { count: 0, limit: 5, remaining: 5 }
+    });
+  } catch (error) {
+    console.error('❌ Erreur générale:', error.message);
+    res.status(500).json({ ok: false, error: 'Erreur serveur' });
   }
 });
 
