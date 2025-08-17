@@ -42,69 +42,7 @@ Quand tu fais un calcul (TVA, cotisations, IR), montre la formule et les étapes
 Si la question n'est pas fiscale/comptable FR, dis-le poliment.
 `;
 
-// ===== Fonction pour obtenir l'IP de l'utilisateur
-function getClientIP(req) {
-  return req.clientIp || 'unknown';
-}
 
-// ===== Fonction pour vérifier et incrémenter l'usage
-async function checkAndIncrementUsage(userIP) {
-  if (!supabase) return { allowed: true, count: 0 };
-  
-  try {
-    // Vérifier si l'utilisateur existe déjà
-    const { data: existingUser } = await supabase
-      .from('usage_limits')
-      .select('*')
-      .eq('user_ip', userIP)
-      .single();
-
-    if (existingUser) {
-      // Vérifier si on doit réinitialiser (nouveau jour)
-      const now = new Date();
-      const lastReset = new Date(existingUser.last_reset);
-      const isNewDay = now.getDate() !== lastReset.getDate() || 
-                      now.getMonth() !== lastReset.getMonth() || 
-                      now.getFullYear() !== lastReset.getFullYear();
-
-      if (isNewDay) {
-        // Réinitialiser pour un nouveau jour
-        const { error } = await supabase
-          .from('usage_limits')
-          .update({ question_count: 1, last_reset: now.toISOString() })
-          .eq('user_ip', userIP);
-        
-        if (error) console.error('❌ Erreur réinitialisation:', error.message);
-        return { allowed: true, count: 1 };
-      } else {
-        // Vérifier la limite
-        if (existingUser.question_count >= 5) {
-          return { allowed: false, count: existingUser.question_count };
-        }
-        
-        // Incrémenter le compteur
-        const { error } = await supabase
-          .from('usage_limits')
-          .update({ question_count: existingUser.question_count + 1 })
-          .eq('user_ip', userIP);
-        
-        if (error) console.error('❌ Erreur incrémentation:', error.message);
-        return { allowed: true, count: existingUser.question_count + 1 };
-      }
-    } else {
-      // Créer un nouvel utilisateur
-      const { error } = await supabase
-        .from('usage_limits')
-        .insert({ user_ip: userIP, question_count: 1 });
-      
-      if (error) console.error('❌ Erreur création utilisateur:', error.message);
-      return { allowed: true, count: 1 };
-    }
-  } catch (error) {
-    console.error('❌ Erreur vérification usage:', error.message);
-    return { allowed: true, count: 0 }; // En cas d'erreur, on autorise
-  }
-}
 
 // ===== API: poser une question
 app.post('/api/ask', async (req, res) => {
@@ -113,50 +51,122 @@ app.post('/api/ask', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'question manquante' });
   }
 
-  // Vérifier la limite d'usage
-  const userIP = getClientIP(req);
-  const usage = await checkAndIncrementUsage(userIP);
-  
-  if (!usage.allowed) {
-    return res.status(429).json({ 
-      ok: false, 
-      error: 'Limite de 5 questions gratuites atteinte. Réessayez demain !',
-      usage: { count: usage.count, limit: 5 }
-    });
-  }
+  // 1. Récupérer l'IP du client avec request-ip
+  const userIP = req.clientIp || 'unknown';
+  console.log(`🌐 IP client: ${userIP}`);
 
-  try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: question }
-      ]
-    });
-    const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
+  // 2. Vérifier dans la table "usage_limits" de Supabase
+  if (supabase) {
+    try {
+      // Vérifier si cet IP existe déjà
+      const { data: existingUser, error: selectError } = await supabase
+        .from('usage_limits')
+        .select('*')
+        .eq('user_ip', userIP)
+        .single();
 
-    if (supabase) {
-      const { error } = await supabase.from('messages').insert({
+      if (selectError && selectError.code !== 'PGRST116') {
+        console.error('❌ Erreur vérification usage:', selectError.message);
+        return res.status(500).json({ ok: false, error: 'Erreur serveur' });
+      }
+
+      // Si l'utilisateur existe et a atteint la limite
+      if (existingUser && existingUser.question_count >= 5) {
+        console.log(`🚫 Limite atteinte pour ${userIP}: ${existingUser.question_count}/5`);
+        return res.status(429).json({ 
+          ok: false, 
+          error: 'Vous avez atteint la limite gratuite de 5 questions.',
+          usage: { count: existingUser.question_count, limit: 5 }
+        });
+      }
+
+      // 4. Générer la réponse avec OpenAI
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: question }
+        ]
+      });
+      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
+
+      // Enregistrer dans la table "messages"
+      const { error: insertError } = await supabase.from('messages').insert({
         user_id: userIP,
         question,
         answer
       });
-      if (error) console.error('❌ Supabase insert:', error.message);
-    } else {
-      console.warn('⚠️ Supabase non initialisé: historique non sauvegardé.');
-    }
+      if (insertError) console.error('❌ Erreur insertion message:', insertError.message);
 
-    console.log(`Q (${userIP}, ${usage.count}/5):`, question);
-    console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-    res.json({ 
-      ok: true, 
-      answer,
-      usage: { count: usage.count, limit: 5 }
-    });
-  } catch (e) {
-    console.error('❌ OpenAI:', e.message);
-    res.status(500).json({ ok: false, error: e.message });
+      // Incrémenter le compteur question_count
+      if (existingUser) {
+        // Utilisateur existe déjà, incrémenter le compteur
+        const { error: updateError } = await supabase
+          .from('usage_limits')
+          .update({ question_count: existingUser.question_count + 1 })
+          .eq('user_ip', userIP);
+        
+        if (updateError) {
+          console.error('❌ Erreur mise à jour compteur:', updateError.message);
+        } else {
+          console.log(`✅ Compteur incrémenté pour ${userIP}: ${existingUser.question_count + 1}/5`);
+        }
+      } else {
+        // Créer une nouvelle ligne pour cet IP
+        const { error: insertLimitError } = await supabase
+          .from('usage_limits')
+          .insert({ 
+            user_ip: userIP, 
+            question_count: 1 
+          });
+        
+        if (insertLimitError) {
+          console.error('❌ Erreur création usage:', insertLimitError.message);
+        } else {
+          console.log(`✅ Nouvel utilisateur créé pour ${userIP}: 1/5`);
+        }
+      }
+
+      console.log(`Q (${userIP}):`, question);
+      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
+      
+      const currentCount = existingUser ? existingUser.question_count + 1 : 1;
+      res.json({ 
+        ok: true, 
+        answer,
+        usage: { count: currentCount, limit: 5 }
+      });
+
+    } catch (error) {
+      console.error('❌ Erreur générale:', error.message);
+      res.status(500).json({ ok: false, error: 'Erreur serveur' });
+    }
+  } else {
+    // Supabase non configuré, générer seulement la réponse OpenAI
+    try {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: question }
+        ]
+      });
+      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
+
+      console.log(`Q (${userIP}, sans limite):`, question);
+      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
+      
+      res.json({ 
+        ok: true, 
+        answer,
+        usage: { count: 0, limit: 5, note: 'Limites désactivées' }
+      });
+    } catch (e) {
+      console.error('❌ OpenAI:', e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
 });
 
@@ -174,7 +184,7 @@ app.get('/api/messages', async (_req, res) => {
 
 // ===== API: vérifier l'usage de l'utilisateur
 app.get('/api/usage', async (req, res) => {
-  const userIP = getClientIP(req);
+  const userIP = req.clientIp || 'unknown';
   
   if (!supabase) {
     return res.json({ ok: true, usage: { count: 0, limit: 5 } });
