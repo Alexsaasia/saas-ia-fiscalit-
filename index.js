@@ -35,6 +35,54 @@ app.use(cors());
 app.use(express.json());
 app.use(requestIp.mw());
 
+// ===== Middleware d'authentification
+const requireAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ 
+      ok: false, 
+      error: 'non authentifié' 
+    });
+  }
+  
+  const access_token = authHeader.split(' ')[1];
+  
+  if (!supabase) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Supabase non configuré' 
+    });
+  }
+  
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(access_token);
+    
+    if (error || !user) {
+      console.error('❌ Erreur authentification:', error?.message);
+      return res.status(401).json({ 
+        ok: false, 
+        error: 'non authentifié' 
+      });
+    }
+    
+    // Attacher l'utilisateur à la requête
+    req.user = {
+      id: user.id,
+      email: user.email
+    };
+    
+    console.log(`🔐 Utilisateur authentifié: ${user.email}`);
+    next();
+  } catch (error) {
+    console.error('❌ Erreur générale authentification:', error.message);
+    res.status(401).json({ 
+      ok: false, 
+      error: 'non authentifié' 
+    });
+  }
+};
+
 // ===== Prompt système
 const SYSTEM_PROMPT = `
 Tu es une aide fiscale/comptable pour la France. Réponds simplement et en français.
@@ -44,7 +92,7 @@ Si la question n'est pas fiscale/comptable FR, dis-le poliment.
 
 
 
-// ===== API: poser une question
+// ===== API: poser une question (version publique - par IP)
 app.post('/api/ask', async (req, res) => {
   const { question } = req.body || {};
   if (!question || typeof question !== 'string') {
@@ -450,51 +498,163 @@ app.post('/auth/signout', async (req, res) => {
   }
 });
 
-// ===== GET /auth/me - Vérifier l'utilisateur connecté
-app.get('/auth/me', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ 
-      ok: false, 
-      error: 'Token d\'accès requis' 
-    });
-  }
-  
-  const access_token = authHeader.split(' ')[1];
-  
-  if (!supabase) {
-    return res.status(500).json({ 
-      ok: false, 
-      error: 'Supabase non configuré' 
-    });
-  }
-  
-  try {
-    const { data: { user }, error } = await supabase.auth.getUser(access_token);
-    
-    if (error) {
-      console.error('❌ Erreur vérification utilisateur:', error.message);
-      return res.status(401).json({ 
-        ok: false, 
-        error: 'Token invalide' 
-      });
+// ===== GET /auth/me - Vérifier l'utilisateur connecté (avec middleware)
+app.get('/auth/me', requireAuth, async (req, res) => {
+  res.json({ 
+    ok: true, 
+    user: {
+      id: req.user.id,
+      email: req.user.email
     }
-    
-    res.json({ 
-      ok: true, 
-      user: {
-        id: user?.id,
-        email: user?.email,
-        created_at: user?.created_at
+  });
+});
+
+// ===== API: poser une question (version authentifiée - par utilisateur)
+app.post('/api/ask/auth', requireAuth, async (req, res) => {
+  const { question } = req.body || {};
+  if (!question || typeof question !== 'string') {
+    return res.status(400).json({ ok: false, error: 'question manquante' });
+  }
+
+  // Utiliser l'ID utilisateur au lieu de l'IP
+  const userId = req.user.id;
+  console.log(`🌐 Utilisateur authentifié: ${req.user.email} (${userId})`);
+
+  if (supabase) {
+    try {
+      // Vérifier si cet utilisateur existe déjà dans usage_limits
+      const { data: existingUser, error: selectError } = await supabase
+        .from('usage_limits')
+        .select('*')
+        .eq('user_ip', userId) // Utiliser l'ID utilisateur comme clé
+        .single();
+
+      if (selectError && selectError.code !== 'PGRST116') {
+        console.error('❌ Erreur vérification usage:', selectError.message);
+        return res.status(500).json({ ok: false, error: 'Erreur serveur' });
       }
-    });
-  } catch (error) {
-    console.error('❌ Erreur générale vérification:', error.message);
-    res.status(500).json({ 
-      ok: false, 
-      error: 'Erreur serveur' 
-    });
+
+      // Vérifier si on doit réinitialiser (nouveau mois)
+      const now = new Date();
+      const lastReset = existingUser ? new Date(existingUser.last_reset) : now;
+      const isNewMonth = now.getMonth() !== lastReset.getMonth() || 
+                        now.getFullYear() !== lastReset.getFullYear();
+
+      if (isNewMonth && existingUser) {
+        // Réinitialiser pour un nouveau mois
+        const { error: resetError } = await supabase
+          .from('usage_limits')
+          .update({ 
+            question_count: 0, 
+            last_reset: now.toISOString() 
+          })
+          .eq('user_ip', userId);
+        
+        if (resetError) {
+          console.error('❌ Erreur réinitialisation mensuelle:', resetError.message);
+        } else {
+          console.log(`🔄 Réinitialisation mensuelle pour ${req.user.email}`);
+          existingUser.question_count = 0;
+        }
+      }
+
+      // Si l'utilisateur existe et a atteint la limite
+      if (existingUser && existingUser.question_count >= 5) {
+        console.log(`🚫 Limite atteinte pour ${req.user.email}: ${existingUser.question_count}/5`);
+        return res.status(429).json({ 
+          ok: false, 
+          error: 'Vous avez atteint la limite gratuite de 5 questions. Réinitialisation le mois prochain.',
+          usage: { count: existingUser.question_count, limit: 5 }
+        });
+      }
+
+      // Générer la réponse avec OpenAI
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: question }
+        ]
+      });
+      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
+
+      // Enregistrer dans la table "messages"
+      const { error: insertError } = await supabase.from('messages').insert({
+        user_id: userId,
+        question,
+        answer
+      });
+      if (insertError) console.error('❌ Erreur insertion message:', insertError.message);
+
+      // Incrémenter le compteur question_count
+      if (existingUser) {
+        // Utilisateur existe déjà, incrémenter le compteur
+        const { error: updateError } = await supabase
+          .from('usage_limits')
+          .update({ question_count: existingUser.question_count + 1 })
+          .eq('user_ip', userId);
+        
+        if (updateError) {
+          console.error('❌ Erreur mise à jour compteur:', updateError.message);
+        } else {
+          console.log(`✅ Compteur incrémenté pour ${req.user.email}: ${existingUser.question_count + 1}/5`);
+        }
+      } else {
+        // Créer une nouvelle ligne pour cet utilisateur
+        const { error: insertLimitError } = await supabase
+          .from('usage_limits')
+          .insert({ 
+            user_ip: userId, 
+            question_count: 1 
+          });
+        
+        if (insertLimitError) {
+          console.error('❌ Erreur création usage:', insertLimitError.message);
+        } else {
+          console.log(`✅ Nouvel utilisateur créé pour ${req.user.email}: 1/5`);
+        }
+      }
+
+      console.log(`Q (${req.user.email}):`, question);
+      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
+      
+      const currentCount = existingUser ? existingUser.question_count + 1 : 1;
+      res.json({ 
+        ok: true, 
+        answer,
+        usage: { count: currentCount, limit: 5 }
+      });
+
+    } catch (error) {
+      console.error('❌ Erreur générale:', error.message);
+      res.status(500).json({ ok: false, error: 'Erreur serveur' });
+    }
+  } else {
+    // Supabase non configuré, générer seulement la réponse OpenAI
+    try {
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: question }
+        ]
+      });
+      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
+
+      console.log(`Q (${req.user.email}, sans limite):`, question);
+      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
+      
+      res.json({ 
+        ok: true, 
+        answer,
+        usage: { count: 0, limit: 5, note: 'Limites désactivées' }
+      });
+    } catch (e) {
+      console.error('❌ OpenAI:', e.message);
+      res.status(500).json({ ok: false, error: e.message });
+    }
   }
 });
 
