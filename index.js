@@ -287,6 +287,217 @@ app.post('/api/reset-usage', async (req, res) => {
   }
 });
 
+// ===== AUTHENTIFICATION SUPABASE =====
+
+// ===== POST /auth/signup - Créer un compte utilisateur
+app.post('/auth/signup', async (req, res) => {
+  const { email, password } = req.body || {};
+  
+  // Validation des données
+  if (!email || !password) {
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'Email et mot de passe requis' 
+    });
+  }
+  
+  if (password.length < 6) {
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'Le mot de passe doit contenir au moins 6 caractères' 
+    });
+  }
+  
+  if (!supabase) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Supabase non configuré' 
+    });
+  }
+  
+  try {
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        emailRedirectTo: `${req.protocol}://${req.get('host')}/auth/callback`
+      }
+    });
+    
+    if (error) {
+      console.error('❌ Erreur inscription:', error.message);
+      return res.status(400).json({ 
+        ok: false, 
+        error: error.message 
+      });
+    }
+    
+    console.log(`✅ Nouvel utilisateur inscrit: ${email}`);
+    res.json({ 
+      ok: true, 
+      message: 'Inscription réussie. Vérifiez votre email pour confirmer votre compte.',
+      user: {
+        id: data.user?.id,
+        email: data.user?.email
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur générale inscription:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur serveur' 
+    });
+  }
+});
+
+// ===== POST /auth/signin - Connecter un utilisateur
+app.post('/auth/signin', async (req, res) => {
+  const { email, password } = req.body || {};
+  
+  // Validation des données
+  if (!email || !password) {
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'Email et mot de passe requis' 
+    });
+  }
+  
+  if (!supabase) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Supabase non configuré' 
+    });
+  }
+  
+  try {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password
+    });
+    
+    if (error) {
+      console.error('❌ Erreur connexion:', error.message);
+      return res.status(401).json({ 
+        ok: false, 
+        error: 'Email ou mot de passe incorrect' 
+      });
+    }
+    
+    console.log(`✅ Utilisateur connecté: ${email}`);
+    res.json({ 
+      ok: true, 
+      message: 'Connexion réussie',
+      user: {
+        id: data.user?.id,
+        email: data.user?.email
+      },
+      session: {
+        access_token: data.session?.access_token,
+        refresh_token: data.session?.refresh_token,
+        expires_at: data.session?.expires_at
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur générale connexion:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur serveur' 
+    });
+  }
+});
+
+// ===== POST /auth/signout - Déconnecter un utilisateur
+app.post('/auth/signout', async (req, res) => {
+  const { access_token } = req.body || {};
+  
+  if (!access_token) {
+    return res.status(400).json({ 
+      ok: false, 
+      error: 'Token d\'accès requis' 
+    });
+  }
+  
+  if (!supabase) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Supabase non configuré' 
+    });
+  }
+  
+  try {
+    // Créer un client Supabase avec le token pour la déconnexion
+    const { error } = await supabase.auth.admin.signOut(access_token);
+    
+    if (error) {
+      console.error('❌ Erreur déconnexion:', error.message);
+      return res.status(400).json({ 
+        ok: false, 
+        error: error.message 
+      });
+    }
+    
+    console.log('✅ Utilisateur déconnecté');
+    res.json({ 
+      ok: true, 
+      message: 'Déconnexion réussie' 
+    });
+  } catch (error) {
+    console.error('❌ Erreur générale déconnexion:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur serveur' 
+    });
+  }
+});
+
+// ===== GET /auth/me - Vérifier l'utilisateur connecté
+app.get('/auth/me', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ 
+      ok: false, 
+      error: 'Token d\'accès requis' 
+    });
+  }
+  
+  const access_token = authHeader.split(' ')[1];
+  
+  if (!supabase) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Supabase non configuré' 
+    });
+  }
+  
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(access_token);
+    
+    if (error) {
+      console.error('❌ Erreur vérification utilisateur:', error.message);
+      return res.status(401).json({ 
+        ok: false, 
+        error: 'Token invalide' 
+      });
+    }
+    
+    res.json({ 
+      ok: true, 
+      user: {
+        id: user?.id,
+        email: user?.email,
+        created_at: user?.created_at
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur générale vérification:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur serveur' 
+    });
+  }
+});
+
 // ===== Route santé
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
