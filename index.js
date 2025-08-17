@@ -75,11 +75,41 @@ async function checkAndIncrementQuota(userId) {
     throw new Error('Supabase non configuré');
   }
 
-  // Calculer le mois/année courant (format: YYYY-MM)
-  const now = new Date();
-  const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-  
   try {
+    // 1. Vérifier le plan de l'utilisateur dans la table profiles
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('plan')
+      .eq('user_id', userId)
+      .single();
+
+    if (profileError && profileError.code !== 'PGRST116') {
+      console.error('❌ Erreur lecture profil utilisateur:', profileError.message);
+      throw new Error(`Erreur lecture profil: ${profileError.message}`);
+    }
+
+    const userPlan = profile ? profile.plan : 'free';
+    console.log(`📋 Plan utilisateur ${userId}: ${userPlan}`);
+
+    // 2. Si l'utilisateur est "pro", pas de limite
+    if (userPlan === 'pro') {
+      console.log(`⭐ Utilisateur Premium ${userId}: accès illimité`);
+      return {
+        currentCount: 0,
+        limit: 'illimité',
+        remaining: 'illimité',
+        plan: 'pro',
+        ym: `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}`
+      };
+    }
+
+    // 3. Si l'utilisateur est "free", appliquer la limite de 5 questions/mois
+    console.log(`🆓 Utilisateur Free ${userId}: limite de 5 questions/mois`);
+    
+    // Calculer le mois/année courant (format: YYYY-MM)
+    const now = new Date();
+    const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    
     // Vérifier si l'utilisateur a déjà des questions ce mois-ci
     const { data: existingRecord, error: selectError } = await supabase
       .from('usage_limits_user')
@@ -116,10 +146,13 @@ async function checkAndIncrementQuota(userId) {
       throw new Error(`Erreur mise à jour quota: ${upsertError.message}`);
     }
 
+    console.log(`✅ Quota incrémenté pour ${userId}: ${newCount}/5 (${ym})`);
+
     return {
       currentCount: newCount,
       limit: 5,
       remaining: 5 - newCount,
+      plan: 'free',
       ym: ym
     };
   } catch (error) {
@@ -196,19 +229,9 @@ app.post('/api/ask', requireAuth, async (req, res) => {
   console.log(`🌐 Utilisateur connecté: ${req.user.email} (${userId})`);
 
   try {
-    // Vérifier le plan de l'utilisateur
-    const userPlan = await getUserPlan(userId);
-    console.log(`📋 Plan utilisateur ${req.user.email}: ${userPlan}`);
-
-    let quota = null;
-    
-    // Si l'utilisateur est en plan "free", vérifier les limites
-    if (userPlan === 'free') {
-      quota = await checkAndIncrementQuota(userId);
-      console.log(`✅ Quota vérifié pour ${req.user.email}: ${quota.currentCount}/${quota.limit} (${quota.ym})`);
-    } else {
-      console.log(`⭐ Utilisateur Premium ${req.user.email}: pas de limite`);
-    }
+    // Vérifier et incrémenter le quota (inclut la vérification du plan)
+    const quota = await checkAndIncrementQuota(userId);
+    console.log(`✅ Quota vérifié pour ${req.user.email}: plan ${quota.plan}`);
 
     // Générer la réponse avec OpenAI
     const completion = await openai.chat.completions.create({
@@ -237,16 +260,12 @@ app.post('/api/ask', requireAuth, async (req, res) => {
     res.json({ 
       ok: true, 
       answer,
-      usage: userPlan === 'free' ? {
+      usage: {
         count: quota.currentCount,
         limit: quota.limit,
         remaining: quota.remaining,
+        plan: quota.plan,
         ym: quota.ym
-      } : {
-        count: 0,
-        limit: 'illimité',
-        remaining: 'illimité',
-        plan: 'pro'
       }
     });
 
