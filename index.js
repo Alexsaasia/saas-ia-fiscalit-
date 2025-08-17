@@ -35,6 +35,64 @@ app.use(cors());
 app.use(express.json());
 app.use(requestIp.mw());
 
+// ===== Helper pour vérifier et incrémenter le quota utilisateur
+async function checkAndIncrementQuota(userId) {
+  if (!supabase) {
+    throw new Error('Supabase non configuré');
+  }
+
+  // Calculer le mois/année courant (format: YYYY-MM)
+  const now = new Date();
+  const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  
+  try {
+    // Vérifier si l'utilisateur a déjà des questions ce mois-ci
+    const { data: existingRecord, error: selectError } = await supabase
+      .from('usage_limits_user')
+      .select('question_count')
+      .eq('user_id', userId)
+      .eq('ym', ym)
+      .single();
+
+    if (selectError && selectError.code !== 'PGRST116') {
+      throw new Error(`Erreur vérification quota: ${selectError.message}`);
+    }
+
+    const currentCount = existingRecord ? existingRecord.question_count : 0;
+    
+    // Vérifier si la limite est atteinte
+    if (currentCount >= 5) {
+      throw new Error(`Limite de 5 questions atteinte pour ${ym}`);
+    }
+
+    // Incrémenter le compteur (UPSERT)
+    const newCount = currentCount + 1;
+    const { error: upsertError } = await supabase
+      .from('usage_limits_user')
+      .upsert({
+        user_id: userId,
+        ym: ym,
+        question_count: newCount,
+        updated_at: now.toISOString()
+      }, {
+        onConflict: 'user_id,ym'
+      });
+
+    if (upsertError) {
+      throw new Error(`Erreur mise à jour quota: ${upsertError.message}`);
+    }
+
+    return {
+      currentCount: newCount,
+      limit: 5,
+      remaining: 5 - newCount,
+      ym: ym
+    };
+  } catch (error) {
+    throw error;
+  }
+}
+
 // ===== Middleware d'authentification
 const requireAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -103,141 +161,59 @@ app.post('/api/ask', requireAuth, async (req, res) => {
   const userId = req.user.id;
   console.log(`🌐 Utilisateur connecté: ${req.user.email} (${userId})`);
 
-  if (supabase) {
-    try {
-      // Vérifier si cet utilisateur existe déjà dans usage_limits
-      const { data: existingUser, error: selectError } = await supabase
-        .from('usage_limits')
-        .select('*')
-        .eq('user_ip', userId) // Utiliser l'ID utilisateur comme clé
-        .single();
+  try {
+    // Vérifier et incrémenter le quota utilisateur
+    const quota = await checkAndIncrementQuota(userId);
+    console.log(`✅ Quota vérifié pour ${req.user.email}: ${quota.currentCount}/${quota.limit} (${quota.ym})`);
 
-      if (selectError && selectError.code !== 'PGRST116') {
-        console.error('❌ Erreur vérification usage:', selectError.message);
-        return res.status(500).json({ ok: false, error: 'Erreur serveur' });
-      }
+    // Générer la réponse avec OpenAI
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: question }
+      ]
+    });
+    const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
 
-      // Vérifier si on doit réinitialiser (nouveau mois)
-      const now = new Date();
-      const lastReset = existingUser ? new Date(existingUser.last_reset) : now;
-      const isNewMonth = now.getMonth() !== lastReset.getMonth() || 
-                        now.getFullYear() !== lastReset.getFullYear();
-
-      if (isNewMonth && existingUser) {
-        // Réinitialiser pour un nouveau mois
-        const { error: resetError } = await supabase
-          .from('usage_limits')
-          .update({ 
-            question_count: 0, 
-            last_reset: now.toISOString() 
-          })
-          .eq('user_ip', userId);
-        
-        if (resetError) {
-          console.error('❌ Erreur réinitialisation mensuelle:', resetError.message);
-        } else {
-          console.log(`🔄 Réinitialisation mensuelle pour ${req.user.email}`);
-          existingUser.question_count = 0;
-        }
-      }
-
-      // Si l'utilisateur existe et a atteint la limite
-      if (existingUser && existingUser.question_count >= 5) {
-        console.log(`🚫 Limite atteinte pour ${req.user.email}: ${existingUser.question_count}/5`);
-        return res.status(429).json({ 
-          ok: false, 
-          error: 'Vous avez atteint la limite gratuite de 5 questions. Réinitialisation le mois prochain.',
-          usage: { count: existingUser.question_count, limit: 5 }
-        });
-      }
-
-      // Générer la réponse avec OpenAI
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: question }
-        ]
-      });
-      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
-
-      // Enregistrer dans la table "messages" avec l'ID utilisateur
+    // Enregistrer dans la table "messages" avec l'ID utilisateur
+    if (supabase) {
       const { error: insertError } = await supabase.from('messages').insert({
         user_id: userId,
         question,
         answer
       });
       if (insertError) console.error('❌ Erreur insertion message:', insertError.message);
+    }
 
-      // Incrémenter le compteur question_count
-      if (existingUser) {
-        // Utilisateur existe déjà, incrémenter le compteur
-        const { error: updateError } = await supabase
-          .from('usage_limits')
-          .update({ question_count: existingUser.question_count + 1 })
-          .eq('user_ip', userId);
-        
-        if (updateError) {
-          console.error('❌ Erreur mise à jour compteur:', updateError.message);
-        } else {
-          console.log(`✅ Compteur incrémenté pour ${req.user.email}: ${existingUser.question_count + 1}/5`);
-        }
-      } else {
-        // Créer une nouvelle ligne pour cet utilisateur
-        const { error: insertLimitError } = await supabase
-          .from('usage_limits')
-          .insert({ 
-            user_ip: userId, 
-            question_count: 1 
-          });
-        
-        if (insertLimitError) {
-          console.error('❌ Erreur création usage:', insertLimitError.message);
-        } else {
-          console.log(`✅ Nouvel utilisateur créé pour ${req.user.email}: 1/5`);
-        }
+    console.log(`Q (${req.user.email}):`, question);
+    console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
+    
+    res.json({ 
+      ok: true, 
+      answer,
+      usage: {
+        count: quota.currentCount,
+        limit: quota.limit,
+        remaining: quota.remaining,
+        ym: quota.ym
       }
+    });
 
-      console.log(`Q (${req.user.email}):`, question);
-      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-      
-      const currentCount = existingUser ? existingUser.question_count + 1 : 1;
-      res.json({ 
-        ok: true, 
-        answer,
-        usage: { count: currentCount, limit: 5 }
+  } catch (error) {
+    console.error('❌ Erreur:', error.message);
+    
+    // Si c'est une erreur de quota, retourner 429
+    if (error.message.includes('Limite de 5 questions atteinte')) {
+      return res.status(429).json({ 
+        ok: false, 
+        error: 'Vous avez atteint la limite gratuite de 5 questions ce mois-ci.',
+        usage: { count: 5, limit: 5, remaining: 0 }
       });
-
-    } catch (error) {
-      console.error('❌ Erreur générale:', error.message);
-      res.status(500).json({ ok: false, error: 'Erreur serveur' });
     }
-  } else {
-    // Supabase non configuré, générer seulement la réponse OpenAI
-    try {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: question }
-        ]
-      });
-      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
-
-      console.log(`Q (${req.user.email}, sans limite):`, question);
-      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-      
-      res.json({ 
-        ok: true, 
-        answer,
-        usage: { count: 0, limit: 5, note: 'Limites désactivées' }
-      });
-    } catch (e) {
-      console.error('❌ OpenAI:', e.message);
-      res.status(500).json({ ok: false, error: e.message });
-    }
+    
+    res.status(500).json({ ok: false, error: 'Erreur serveur' });
   }
 });
 
