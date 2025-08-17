@@ -4,12 +4,15 @@ import cors from 'cors';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
 import requestIp from 'request-ip';
+import Stripe from 'stripe';
 
 // ===== Logs de démarrage (sans dévoiler les secrets)
 function preview(v){ if(!v) return 'undefined'; return v.slice(0, 40) + '...'; }
 console.log('🔧 OPENAI_API_KEY présent ? ', !!process.env.OPENAI_API_KEY);
 console.log('🔧 SUPABASE_URL = ', preview(process.env.SUPABASE_URL));
 console.log('🔧 ANON commence par eyJ ? ', (process.env.SUPABASE_ANON_KEY||'').startsWith('eyJ'));
+console.log('🔧 STRIPE_SECRET_KEY présent ? ', !!process.env.STRIPE_SECRET_KEY);
+console.log('🔧 STRIPE_PRICE_ID présent ? ', !!process.env.STRIPE_PRICE_ID);
 
 // ===== Garde-fou création Supabase
 function safeCreateSupabase(url, key) {
@@ -28,6 +31,11 @@ const supabase = safeCreateSupabase(process.env.SUPABASE_URL, process.env.SUPABA
 
 // ===== OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ===== Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-12-18.acacia'
+});
 
 // ===== App
 const app = express();
@@ -490,6 +498,178 @@ app.get('/auth/me', requireAuth, async (req, res) => {
 });
 
 
+
+// ===== Routes de facturation Stripe
+
+// ===== POST /billing/create-checkout-session - Créer une session Checkout
+app.post('/billing/create-checkout-session', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const userEmail = req.user.email;
+  
+  if (!stripe || !process.env.STRIPE_PRICE_ID) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Stripe non configuré' 
+    });
+  }
+
+  try {
+    // Créer la session Checkout
+    const session = await stripe.checkout.sessions.create({
+      customer_email: userEmail,
+      line_items: [
+        {
+          price: process.env.STRIPE_PRICE_ID,
+          quantity: 1,
+        },
+      ],
+      mode: 'subscription',
+      success_url: `${process.env.APP_BASE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.APP_BASE_URL}/billing/cancel`,
+      metadata: {
+        user_id: userId,
+        user_email: userEmail
+      },
+      subscription_data: {
+        metadata: {
+          user_id: userId,
+          user_email: userEmail
+        }
+      }
+    });
+
+    console.log(`💳 Session Checkout créée pour ${userEmail}: ${session.id}`);
+    
+    res.json({ 
+      ok: true, 
+      session_id: session.id,
+      checkout_url: session.url 
+    });
+
+  } catch (error) {
+    console.error('❌ Erreur création session Checkout:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur création session de paiement' 
+    });
+  }
+});
+
+// ===== GET /billing/portal - Rediriger vers le portail client Stripe
+app.get('/billing/portal', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  const userEmail = req.user.email;
+
+  if (!stripe) {
+    return res.status(500).json({ 
+      ok: false, 
+      error: 'Stripe non configuré' 
+    });
+  }
+
+  try {
+    // Trouver le client Stripe par email
+    const customers = await stripe.customers.list({
+      email: userEmail,
+      limit: 1
+    });
+
+    if (customers.data.length === 0) {
+      return res.status(404).json({ 
+        ok: false, 
+        error: 'Aucun abonnement trouvé pour cet utilisateur' 
+      });
+    }
+
+    const customer = customers.data[0];
+
+    // Créer la session du portail client
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customer.id,
+      return_url: `${process.env.APP_BASE_URL}/billing/portal-return`,
+    });
+
+    console.log(`🔗 Session portail créée pour ${userEmail}: ${session.id}`);
+    
+    res.json({ 
+      ok: true, 
+      portal_url: session.url 
+    });
+
+  } catch (error) {
+    console.error('❌ Erreur création session portail:', error.message);
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Erreur accès au portail client' 
+    });
+  }
+});
+
+// ===== GET /billing/success - Page de succès après paiement
+app.get('/billing/success', (req, res) => {
+  const sessionId = req.query.session_id;
+  
+  res.send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Paiement réussi - Fiscalité FR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body style="font-family:system-ui, sans-serif; max-width:800px; margin:40px auto; padding:0 16px; text-align:center;">
+  <h1>✅ Paiement réussi !</h1>
+  <p>Votre abonnement Premium a été activé avec succès.</p>
+  <p>Vous avez maintenant un accès illimité aux questions de fiscalité française.</p>
+  <p><strong>Session ID:</strong> ${sessionId || 'Non disponible'}</p>
+  <br/>
+  <a href="/" style="background:#007bff; color:white; padding:12px 24px; text-decoration:none; border-radius:4px;">
+    Retour à l'accueil
+  </a>
+</body>
+</html>`);
+});
+
+// ===== GET /billing/cancel - Page d'annulation
+app.get('/billing/cancel', (req, res) => {
+  res.send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Paiement annulé - Fiscalité FR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body style="font-family:system-ui, sans-serif; max-width:800px; margin:40px auto; padding:0 16px; text-align:center;">
+  <h1>❌ Paiement annulé</h1>
+  <p>Votre paiement a été annulé. Aucun montant n'a été débité.</p>
+  <p>Vous pouvez réessayer à tout moment.</p>
+  <br/>
+  <a href="/" style="background:#007bff; color:white; padding:12px 24px; text-decoration:none; border-radius:4px;">
+    Retour à l'accueil
+  </a>
+</body>
+</html>`);
+});
+
+// ===== GET /billing/portal-return - Retour du portail client
+app.get('/billing/portal-return', (req, res) => {
+  res.send(`<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>Portail client - Fiscalité FR</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+</head>
+<body style="font-family:system-ui, sans-serif; max-width:800px; margin:40px auto; padding:0 16px; text-align:center;">
+  <h1>🔗 Portail client</h1>
+  <p>Vous êtes revenu du portail client Stripe.</p>
+  <p>Vos modifications d'abonnement ont été prises en compte.</p>
+  <br/>
+  <a href="/" style="background:#007bff; color:white; padding:12px 24px; text-decoration:none; border-radius:4px;">
+    Retour à l'accueil
+  </a>
+</body>
+</html>`);
+});
 
 // ===== Route santé
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
