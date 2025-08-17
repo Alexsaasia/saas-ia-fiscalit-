@@ -92,25 +92,24 @@ Si la question n'est pas fiscale/comptable FR, dis-le poliment.
 
 
 
-// ===== API: poser une question (version publique - par IP)
-app.post('/api/ask', async (req, res) => {
+// ===== API: poser une question (authentifiée - par utilisateur)
+app.post('/api/ask', requireAuth, async (req, res) => {
   const { question } = req.body || {};
   if (!question || typeof question !== 'string') {
     return res.status(400).json({ ok: false, error: 'question manquante' });
   }
 
-  // 1. Récupérer l'IP du client avec request-ip
-  const userIP = req.clientIp || 'unknown';
-  console.log(`🌐 IP client: ${userIP}`);
+  // Utiliser l'ID utilisateur connecté
+  const userId = req.user.id;
+  console.log(`🌐 Utilisateur connecté: ${req.user.email} (${userId})`);
 
-  // 2. Vérifier dans la table "usage_limits" de Supabase
   if (supabase) {
     try {
-      // Vérifier si cet IP existe déjà
+      // Vérifier si cet utilisateur existe déjà dans usage_limits
       const { data: existingUser, error: selectError } = await supabase
         .from('usage_limits')
         .select('*')
-        .eq('user_ip', userIP)
+        .eq('user_ip', userId) // Utiliser l'ID utilisateur comme clé
         .single();
 
       if (selectError && selectError.code !== 'PGRST116') {
@@ -120,11 +119,11 @@ app.post('/api/ask', async (req, res) => {
 
       // Vérifier si on doit réinitialiser (nouveau mois)
       const now = new Date();
-      const lastReset = new Date(existingUser.last_reset);
+      const lastReset = existingUser ? new Date(existingUser.last_reset) : now;
       const isNewMonth = now.getMonth() !== lastReset.getMonth() || 
                         now.getFullYear() !== lastReset.getFullYear();
 
-      if (isNewMonth) {
+      if (isNewMonth && existingUser) {
         // Réinitialiser pour un nouveau mois
         const { error: resetError } = await supabase
           .from('usage_limits')
@@ -132,19 +131,19 @@ app.post('/api/ask', async (req, res) => {
             question_count: 0, 
             last_reset: now.toISOString() 
           })
-          .eq('user_ip', userIP);
+          .eq('user_ip', userId);
         
         if (resetError) {
           console.error('❌ Erreur réinitialisation mensuelle:', resetError.message);
         } else {
-          console.log(`🔄 Réinitialisation mensuelle pour ${userIP}`);
+          console.log(`🔄 Réinitialisation mensuelle pour ${req.user.email}`);
           existingUser.question_count = 0;
         }
       }
 
       // Si l'utilisateur existe et a atteint la limite
       if (existingUser && existingUser.question_count >= 5) {
-        console.log(`🚫 Limite atteinte pour ${userIP}: ${existingUser.question_count}/5`);
+        console.log(`🚫 Limite atteinte pour ${req.user.email}: ${existingUser.question_count}/5`);
         return res.status(429).json({ 
           ok: false, 
           error: 'Vous avez atteint la limite gratuite de 5 questions. Réinitialisation le mois prochain.',
@@ -152,7 +151,7 @@ app.post('/api/ask', async (req, res) => {
         });
       }
 
-      // 4. Générer la réponse avec OpenAI
+      // Générer la réponse avec OpenAI
       const completion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
         temperature: 0.2,
@@ -163,9 +162,9 @@ app.post('/api/ask', async (req, res) => {
       });
       const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
 
-      // Enregistrer dans la table "messages"
+      // Enregistrer dans la table "messages" avec l'ID utilisateur
       const { error: insertError } = await supabase.from('messages').insert({
-        user_id: userIP,
+        user_id: userId,
         question,
         answer
       });
@@ -177,30 +176,30 @@ app.post('/api/ask', async (req, res) => {
         const { error: updateError } = await supabase
           .from('usage_limits')
           .update({ question_count: existingUser.question_count + 1 })
-          .eq('user_ip', userIP);
+          .eq('user_ip', userId);
         
         if (updateError) {
           console.error('❌ Erreur mise à jour compteur:', updateError.message);
         } else {
-          console.log(`✅ Compteur incrémenté pour ${userIP}: ${existingUser.question_count + 1}/5`);
+          console.log(`✅ Compteur incrémenté pour ${req.user.email}: ${existingUser.question_count + 1}/5`);
         }
       } else {
-        // Créer une nouvelle ligne pour cet IP
+        // Créer une nouvelle ligne pour cet utilisateur
         const { error: insertLimitError } = await supabase
           .from('usage_limits')
           .insert({ 
-            user_ip: userIP, 
+            user_ip: userId, 
             question_count: 1 
           });
         
         if (insertLimitError) {
           console.error('❌ Erreur création usage:', insertLimitError.message);
         } else {
-          console.log(`✅ Nouvel utilisateur créé pour ${userIP}: 1/5`);
+          console.log(`✅ Nouvel utilisateur créé pour ${req.user.email}: 1/5`);
         }
       }
 
-      console.log(`Q (${userIP}):`, question);
+      console.log(`Q (${req.user.email}):`, question);
       console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
       
       const currentCount = existingUser ? existingUser.question_count + 1 : 1;
@@ -227,7 +226,7 @@ app.post('/api/ask', async (req, res) => {
       });
       const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
 
-      console.log(`Q (${userIP}, sans limite):`, question);
+      console.log(`Q (${req.user.email}, sans limite):`, question);
       console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
       
       res.json({ 
@@ -242,14 +241,19 @@ app.post('/api/ask', async (req, res) => {
   }
 });
 
-// ===== API: lire historique (10 derniers)
-app.get('/api/messages', async (_req, res) => {
+// ===== API: lire historique (authentifié - messages de l'utilisateur connecté)
+app.get('/api/messages', requireAuth, async (req, res) => {
+  const userId = req.user.id;
+  
   if (!supabase) return res.json({ ok: true, data: [] });
+  
   const { data, error } = await supabase
     .from('messages')
     .select('*')
+    .eq('user_id', userId) // Filtrer par l'utilisateur connecté
     .order('created_at', { ascending: false })
     .limit(10);
+    
   if (error) return res.status(500).json({ ok:false, error: error.message });
   res.json({ ok:true, data });
 });
@@ -509,154 +513,7 @@ app.get('/auth/me', requireAuth, async (req, res) => {
   });
 });
 
-// ===== API: poser une question (version authentifiée - par utilisateur)
-app.post('/api/ask/auth', requireAuth, async (req, res) => {
-  const { question } = req.body || {};
-  if (!question || typeof question !== 'string') {
-    return res.status(400).json({ ok: false, error: 'question manquante' });
-  }
 
-  // Utiliser l'ID utilisateur au lieu de l'IP
-  const userId = req.user.id;
-  console.log(`🌐 Utilisateur authentifié: ${req.user.email} (${userId})`);
-
-  if (supabase) {
-    try {
-      // Vérifier si cet utilisateur existe déjà dans usage_limits
-      const { data: existingUser, error: selectError } = await supabase
-        .from('usage_limits')
-        .select('*')
-        .eq('user_ip', userId) // Utiliser l'ID utilisateur comme clé
-        .single();
-
-      if (selectError && selectError.code !== 'PGRST116') {
-        console.error('❌ Erreur vérification usage:', selectError.message);
-        return res.status(500).json({ ok: false, error: 'Erreur serveur' });
-      }
-
-      // Vérifier si on doit réinitialiser (nouveau mois)
-      const now = new Date();
-      const lastReset = existingUser ? new Date(existingUser.last_reset) : now;
-      const isNewMonth = now.getMonth() !== lastReset.getMonth() || 
-                        now.getFullYear() !== lastReset.getFullYear();
-
-      if (isNewMonth && existingUser) {
-        // Réinitialiser pour un nouveau mois
-        const { error: resetError } = await supabase
-          .from('usage_limits')
-          .update({ 
-            question_count: 0, 
-            last_reset: now.toISOString() 
-          })
-          .eq('user_ip', userId);
-        
-        if (resetError) {
-          console.error('❌ Erreur réinitialisation mensuelle:', resetError.message);
-        } else {
-          console.log(`🔄 Réinitialisation mensuelle pour ${req.user.email}`);
-          existingUser.question_count = 0;
-        }
-      }
-
-      // Si l'utilisateur existe et a atteint la limite
-      if (existingUser && existingUser.question_count >= 5) {
-        console.log(`🚫 Limite atteinte pour ${req.user.email}: ${existingUser.question_count}/5`);
-        return res.status(429).json({ 
-          ok: false, 
-          error: 'Vous avez atteint la limite gratuite de 5 questions. Réinitialisation le mois prochain.',
-          usage: { count: existingUser.question_count, limit: 5 }
-        });
-      }
-
-      // Générer la réponse avec OpenAI
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: question }
-        ]
-      });
-      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
-
-      // Enregistrer dans la table "messages"
-      const { error: insertError } = await supabase.from('messages').insert({
-        user_id: userId,
-        question,
-        answer
-      });
-      if (insertError) console.error('❌ Erreur insertion message:', insertError.message);
-
-      // Incrémenter le compteur question_count
-      if (existingUser) {
-        // Utilisateur existe déjà, incrémenter le compteur
-        const { error: updateError } = await supabase
-          .from('usage_limits')
-          .update({ question_count: existingUser.question_count + 1 })
-          .eq('user_ip', userId);
-        
-        if (updateError) {
-          console.error('❌ Erreur mise à jour compteur:', updateError.message);
-        } else {
-          console.log(`✅ Compteur incrémenté pour ${req.user.email}: ${existingUser.question_count + 1}/5`);
-        }
-      } else {
-        // Créer une nouvelle ligne pour cet utilisateur
-        const { error: insertLimitError } = await supabase
-          .from('usage_limits')
-          .insert({ 
-            user_ip: userId, 
-            question_count: 1 
-          });
-        
-        if (insertLimitError) {
-          console.error('❌ Erreur création usage:', insertLimitError.message);
-        } else {
-          console.log(`✅ Nouvel utilisateur créé pour ${req.user.email}: 1/5`);
-        }
-      }
-
-      console.log(`Q (${req.user.email}):`, question);
-      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-      
-      const currentCount = existingUser ? existingUser.question_count + 1 : 1;
-      res.json({ 
-        ok: true, 
-        answer,
-        usage: { count: currentCount, limit: 5 }
-      });
-
-    } catch (error) {
-      console.error('❌ Erreur générale:', error.message);
-      res.status(500).json({ ok: false, error: 'Erreur serveur' });
-    }
-  } else {
-    // Supabase non configuré, générer seulement la réponse OpenAI
-    try {
-      const completion = await openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: question }
-        ]
-      });
-      const answer = completion.choices?.[0]?.message?.content || 'Aucune réponse.';
-
-      console.log(`Q (${req.user.email}, sans limite):`, question);
-      console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-      
-      res.json({ 
-        ok: true, 
-        answer,
-        usage: { count: 0, limit: 5, note: 'Limites désactivées' }
-      });
-    } catch (e) {
-      console.error('❌ OpenAI:', e.message);
-      res.status(500).json({ ok: false, error: e.message });
-    }
-  }
-});
 
 // ===== Route santé
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
