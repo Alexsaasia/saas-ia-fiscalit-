@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
 import { createClient } from '@supabase/supabase-js';
+import requestIp from 'request-ip';
 
 // ===== Logs de démarrage (sans dévoiler les secrets)
 function preview(v){ if(!v) return 'undefined'; return v.slice(0, 40) + '...'; }
@@ -32,6 +33,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(requestIp.mw());
 
 // ===== Prompt système
 const SYSTEM_PROMPT = `
@@ -42,11 +44,7 @@ Si la question n'est pas fiscale/comptable FR, dis-le poliment.
 
 // ===== Fonction pour obtenir l'IP de l'utilisateur
 function getClientIP(req) {
-  return req.headers['x-forwarded-for']?.split(',')[0] || 
-         req.headers['x-real-ip'] || 
-         req.connection.remoteAddress || 
-         req.socket.remoteAddress || 
-         'unknown';
+  return req.clientIp || 'unknown';
 }
 
 // ===== Fonction pour vérifier et incrémenter l'usage
