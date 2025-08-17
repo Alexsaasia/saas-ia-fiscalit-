@@ -13,6 +13,7 @@ console.log('🔧 SUPABASE_URL = ', preview(process.env.SUPABASE_URL));
 console.log('🔧 ANON commence par eyJ ? ', (process.env.SUPABASE_ANON_KEY||'').startsWith('eyJ'));
 console.log('🔧 STRIPE_SECRET_KEY présent ? ', !!process.env.STRIPE_SECRET_KEY);
 console.log('🔧 STRIPE_PRICE_ID présent ? ', !!process.env.STRIPE_PRICE_ID);
+console.log('🔧 STRIPE_WEBHOOK_SECRET présent ? ', !!process.env.STRIPE_WEBHOOK_SECRET);
 
 // ===== Garde-fou création Supabase
 function safeCreateSupabase(url, key) {
@@ -42,6 +43,31 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(requestIp.mw());
+
+// ===== Helper pour vérifier le plan de l'utilisateur
+async function getUserPlan(userId) {
+  if (!supabase) {
+    return 'free'; // Par défaut si Supabase n'est pas configuré
+  }
+
+  try {
+    const { data: profile, error } = await supabase
+      .from('profiles')
+      .select('plan')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('❌ Erreur récupération plan utilisateur:', error.message);
+      return 'free';
+    }
+
+    return profile ? profile.plan : 'free';
+  } catch (error) {
+    console.error('❌ Erreur générale getUserPlan:', error.message);
+    return 'free';
+  }
+}
 
 // ===== Helper pour vérifier et incrémenter le quota utilisateur
 async function checkAndIncrementQuota(userId) {
@@ -170,9 +196,19 @@ app.post('/api/ask', requireAuth, async (req, res) => {
   console.log(`🌐 Utilisateur connecté: ${req.user.email} (${userId})`);
 
   try {
-    // Vérifier et incrémenter le quota utilisateur
-    const quota = await checkAndIncrementQuota(userId);
-    console.log(`✅ Quota vérifié pour ${req.user.email}: ${quota.currentCount}/${quota.limit} (${quota.ym})`);
+    // Vérifier le plan de l'utilisateur
+    const userPlan = await getUserPlan(userId);
+    console.log(`📋 Plan utilisateur ${req.user.email}: ${userPlan}`);
+
+    let quota = null;
+    
+    // Si l'utilisateur est en plan "free", vérifier les limites
+    if (userPlan === 'free') {
+      quota = await checkAndIncrementQuota(userId);
+      console.log(`✅ Quota vérifié pour ${req.user.email}: ${quota.currentCount}/${quota.limit} (${quota.ym})`);
+    } else {
+      console.log(`⭐ Utilisateur Premium ${req.user.email}: pas de limite`);
+    }
 
     // Générer la réponse avec OpenAI
     const completion = await openai.chat.completions.create({
@@ -201,11 +237,16 @@ app.post('/api/ask', requireAuth, async (req, res) => {
     res.json({ 
       ok: true, 
       answer,
-      usage: {
+      usage: userPlan === 'free' ? {
         count: quota.currentCount,
         limit: quota.limit,
         remaining: quota.remaining,
         ym: quota.ym
+      } : {
+        count: 0,
+        limit: 'illimité',
+        remaining: 'illimité',
+        plan: 'pro'
       }
     });
 
@@ -488,13 +529,28 @@ app.post('/auth/signout', async (req, res) => {
 
 // ===== GET /auth/me - Vérifier l'utilisateur connecté (avec middleware)
 app.get('/auth/me', requireAuth, async (req, res) => {
-  res.json({ 
-    ok: true, 
-    user: {
-      id: req.user.id,
-      email: req.user.email
-    }
-  });
+  try {
+    const userPlan = await getUserPlan(req.user.id);
+    
+    res.json({ 
+      ok: true, 
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        plan: userPlan
+      }
+    });
+  } catch (error) {
+    console.error('❌ Erreur récupération plan:', error.message);
+    res.json({ 
+      ok: true, 
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        plan: 'free'
+      }
+    });
+  }
 });
 
 
@@ -670,6 +726,186 @@ app.get('/billing/portal-return', (req, res) => {
 </body>
 </html>`);
 });
+
+// ===== Webhook Stripe pour gérer les abonnements
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  
+  if (!process.env.STRIPE_WEBHOOK_SECRET) {
+    console.error('❌ STRIPE_WEBHOOK_SECRET non configuré');
+    return res.status(500).json({ ok: false, error: 'Webhook non configuré' });
+  }
+
+  let event;
+
+  try {
+    // Vérifier la signature du webhook
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    console.log(`🔔 Webhook reçu: ${event.type}`);
+  } catch (err) {
+    console.error('❌ Erreur signature webhook:', err.message);
+    return res.status(400).json({ ok: false, error: 'Signature invalide' });
+  }
+
+  try {
+    // Traiter les événements d'abonnement
+    switch (event.type) {
+      case 'checkout.session.completed':
+        await handleCheckoutSessionCompleted(event.data.object);
+        break;
+      
+      case 'customer.subscription.updated':
+        await handleSubscriptionUpdated(event.data.object);
+        break;
+      
+      case 'customer.subscription.deleted':
+        await handleSubscriptionDeleted(event.data.object);
+        break;
+      
+      default:
+        console.log(`ℹ️ Événement non traité: ${event.type}`);
+    }
+
+    res.json({ ok: true, received: true });
+  } catch (error) {
+    console.error('❌ Erreur traitement webhook:', error.message);
+    res.status(500).json({ ok: false, error: 'Erreur traitement webhook' });
+  }
+});
+
+// ===== Fonctions de traitement des événements Stripe
+
+async function handleCheckoutSessionCompleted(session) {
+  const customerEmail = session.customer_details?.email;
+  const customerId = session.customer;
+  const subscriptionId = session.subscription;
+  
+  if (!customerEmail) {
+    console.error('❌ Email client manquant dans la session');
+    return;
+  }
+
+  console.log(`💳 Session Checkout complétée pour ${customerEmail}`);
+  
+  // Mettre à jour ou créer le profil utilisateur
+  await updateUserProfile(customerEmail, 'pro', customerId, subscriptionId);
+}
+
+async function handleSubscriptionUpdated(subscription) {
+  const customerId = subscription.customer;
+  const subscriptionId = subscription.id;
+  const status = subscription.status;
+  
+  console.log(`📅 Abonnement mis à jour: ${subscriptionId} (${status})`);
+  
+  // Récupérer l'email du client depuis Stripe
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    const customerEmail = customer.email;
+    
+    if (status === 'active') {
+      await updateUserProfile(customerEmail, 'pro', customerId, subscriptionId);
+    } else if (status === 'canceled' || status === 'unpaid') {
+      await updateUserProfile(customerEmail, 'free', customerId, subscriptionId);
+    }
+  } catch (error) {
+    console.error('❌ Erreur récupération client Stripe:', error.message);
+  }
+}
+
+async function handleSubscriptionDeleted(subscription) {
+  const customerId = subscription.customer;
+  const subscriptionId = subscription.id;
+  
+  console.log(`🗑️ Abonnement supprimé: ${subscriptionId}`);
+  
+  // Récupérer l'email du client depuis Stripe
+  try {
+    const customer = await stripe.customers.retrieve(customerId);
+    const customerEmail = customer.email;
+    
+    await updateUserProfile(customerEmail, 'free', customerId, subscriptionId);
+  } catch (error) {
+    console.error('❌ Erreur récupération client Stripe:', error.message);
+  }
+}
+
+async function updateUserProfile(email, plan, stripeCustomerId = null, stripeSubscriptionId = null) {
+  if (!supabase) {
+    console.error('❌ Supabase non configuré');
+    return;
+  }
+
+  try {
+    // Trouver l'utilisateur Supabase par email
+    const { data: users, error: userError } = await supabase.auth.admin.listUsers();
+    
+    if (userError) {
+      console.error('❌ Erreur récupération utilisateurs:', userError.message);
+      return;
+    }
+
+    const user = users.users.find(u => u.email === email);
+    
+    if (!user) {
+      console.error(`❌ Utilisateur non trouvé pour l'email: ${email}`);
+      return;
+    }
+
+    // Vérifier si le profil existe déjà
+    const { data: existingProfile, error: selectError } = await supabase
+      .from('profiles')
+      .select('*')
+      .eq('user_id', user.id)
+      .single();
+
+    if (selectError && selectError.code !== 'PGRST116') {
+      console.error('❌ Erreur vérification profil:', selectError.message);
+      return;
+    }
+
+    const profileData = {
+      user_id: user.id,
+      email: email,
+      plan: plan,
+      updated_at: new Date().toISOString()
+    };
+
+    if (stripeCustomerId) {
+      profileData.stripe_customer_id = stripeCustomerId;
+    }
+    if (stripeSubscriptionId) {
+      profileData.stripe_subscription_id = stripeSubscriptionId;
+    }
+
+    if (existingProfile) {
+      // Mettre à jour le profil existant
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update(profileData)
+        .eq('user_id', user.id);
+
+      if (updateError) {
+        console.error('❌ Erreur mise à jour profil:', updateError.message);
+      } else {
+        console.log(`✅ Profil mis à jour pour ${email}: plan ${plan}`);
+      }
+    } else {
+      // Créer un nouveau profil
+      const { error: insertError } = await supabase
+        .from('profiles')
+        .insert(profileData);
+
+      if (insertError) {
+        console.error('❌ Erreur création profil:', insertError.message);
+      } else {
+        console.log(`✅ Nouveau profil créé pour ${email}: plan ${plan}`);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Erreur générale updateUserProfile:', error.message);
+  }
+}
 
 // ===== Route santé
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
