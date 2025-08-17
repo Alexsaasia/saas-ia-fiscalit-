@@ -40,12 +40,93 @@ Quand tu fais un calcul (TVA, cotisations, IR), montre la formule et les étapes
 Si la question n'est pas fiscale/comptable FR, dis-le poliment.
 `;
 
+// ===== Fonction pour obtenir l'IP de l'utilisateur
+function getClientIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0] || 
+         req.headers['x-real-ip'] || 
+         req.connection.remoteAddress || 
+         req.socket.remoteAddress || 
+         'unknown';
+}
+
+// ===== Fonction pour vérifier et incrémenter l'usage
+async function checkAndIncrementUsage(userIP) {
+  if (!supabase) return { allowed: true, count: 0 };
+  
+  try {
+    // Vérifier si l'utilisateur existe déjà
+    const { data: existingUser } = await supabase
+      .from('usage_limits')
+      .select('*')
+      .eq('user_ip', userIP)
+      .single();
+
+    if (existingUser) {
+      // Vérifier si on doit réinitialiser (nouveau jour)
+      const now = new Date();
+      const lastReset = new Date(existingUser.last_reset);
+      const isNewDay = now.getDate() !== lastReset.getDate() || 
+                      now.getMonth() !== lastReset.getMonth() || 
+                      now.getFullYear() !== lastReset.getFullYear();
+
+      if (isNewDay) {
+        // Réinitialiser pour un nouveau jour
+        const { error } = await supabase
+          .from('usage_limits')
+          .update({ question_count: 1, last_reset: now.toISOString() })
+          .eq('user_ip', userIP);
+        
+        if (error) console.error('❌ Erreur réinitialisation:', error.message);
+        return { allowed: true, count: 1 };
+      } else {
+        // Vérifier la limite
+        if (existingUser.question_count >= 5) {
+          return { allowed: false, count: existingUser.question_count };
+        }
+        
+        // Incrémenter le compteur
+        const { error } = await supabase
+          .from('usage_limits')
+          .update({ question_count: existingUser.question_count + 1 })
+          .eq('user_ip', userIP);
+        
+        if (error) console.error('❌ Erreur incrémentation:', error.message);
+        return { allowed: true, count: existingUser.question_count + 1 };
+      }
+    } else {
+      // Créer un nouvel utilisateur
+      const { error } = await supabase
+        .from('usage_limits')
+        .insert({ user_ip: userIP, question_count: 1 });
+      
+      if (error) console.error('❌ Erreur création utilisateur:', error.message);
+      return { allowed: true, count: 1 };
+    }
+  } catch (error) {
+    console.error('❌ Erreur vérification usage:', error.message);
+    return { allowed: true, count: 0 }; // En cas d'erreur, on autorise
+  }
+}
+
 // ===== API: poser une question
 app.post('/api/ask', async (req, res) => {
   const { question } = req.body || {};
   if (!question || typeof question !== 'string') {
     return res.status(400).json({ ok: false, error: 'question manquante' });
   }
+
+  // Vérifier la limite d'usage
+  const userIP = getClientIP(req);
+  const usage = await checkAndIncrementUsage(userIP);
+  
+  if (!usage.allowed) {
+    return res.status(429).json({ 
+      ok: false, 
+      error: 'Limite de 5 questions gratuites atteinte. Réessayez demain !',
+      usage: { count: usage.count, limit: 5 }
+    });
+  }
+
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -59,7 +140,7 @@ app.post('/api/ask', async (req, res) => {
 
     if (supabase) {
       const { error } = await supabase.from('messages').insert({
-        user_id: 'demo',
+        user_id: userIP,
         question,
         answer
       });
@@ -68,9 +149,13 @@ app.post('/api/ask', async (req, res) => {
       console.warn('⚠️ Supabase non initialisé: historique non sauvegardé.');
     }
 
-    console.log('Q:', question);
+    console.log(`Q (${userIP}, ${usage.count}/5):`, question);
     console.log('A:', answer.slice(0, 160) + (answer.length > 160 ? '...' : ''));
-    res.json({ ok: true, answer });
+    res.json({ 
+      ok: true, 
+      answer,
+      usage: { count: usage.count, limit: 5 }
+    });
   } catch (e) {
     console.error('❌ OpenAI:', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -87,6 +172,53 @@ app.get('/api/messages', async (_req, res) => {
     .limit(10);
   if (error) return res.status(500).json({ ok:false, error: error.message });
   res.json({ ok:true, data });
+});
+
+// ===== API: vérifier l'usage de l'utilisateur
+app.get('/api/usage', async (req, res) => {
+  const userIP = getClientIP(req);
+  
+  if (!supabase) {
+    return res.json({ ok: true, usage: { count: 0, limit: 5 } });
+  }
+  
+  try {
+    const { data: user } = await supabase
+      .from('usage_limits')
+      .select('*')
+      .eq('user_ip', userIP)
+      .single();
+    
+    if (user) {
+      res.json({ 
+        ok: true, 
+        usage: { 
+          count: user.question_count, 
+          limit: 5,
+          remaining: Math.max(0, 5 - user.question_count)
+        }
+      });
+    } else {
+      res.json({ 
+        ok: true, 
+        usage: { 
+          count: 0, 
+          limit: 5,
+          remaining: 5
+        }
+      });
+    }
+  } catch (error) {
+    console.error('❌ Erreur vérification usage:', error.message);
+    res.json({ 
+      ok: true, 
+      usage: { 
+        count: 0, 
+        limit: 5,
+        remaining: 5
+      }
+    });
+  }
 });
 
 // ===== Route santé
